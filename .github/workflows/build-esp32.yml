@@ -1,0 +1,147 @@
+name: Build ESP32 MicroPython Firmware
+
+# 触发条件：推送到main分支或手动触发
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:  # 允许手动触发
+
+jobs:
+  build-esp32:
+    runs-on: ubuntu-latest
+    
+    strategy:
+      matrix:
+        # 定义要构建的ESP32变体
+        board: [ESP32_GENERIC, ESP32_GENERIC_S2, ESP32_GENERIC_S3, ESP32_GENERIC_C3]
+    
+    steps:
+    # 1. 检出代码
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive  # 递归检出子模块
+    
+    # 2. 设置Python环境
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.x'
+    
+    # 3. 安装系统依赖
+    - name: Install system dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y git wget flex bison gperf python3 python3-pip python3-venv cmake ninja-build ccache libffi-dev libssl-dev dfu-util libusb-1.0-0
+    
+    # 4. 设置ESP-IDF环境
+    - name: Setup ESP-IDF
+      run: |
+        # 创建ESP-IDF目录
+        mkdir -p ~/esp
+        cd ~/esp
+        
+        # 克隆ESP-IDF (使用与MicroPython兼容的版本)
+        git clone --recursive https://github.com/espressif/esp-idf.git
+        cd esp-idf
+        
+        # 检出到与MicroPython兼容的版本 (通常是v5.0.x)
+        git checkout v5.0.4
+        git submodule update --init --recursive
+        
+        # 安装ESP-IDF
+        ./install.sh esp32,esp32s2,esp32s3,esp32c3
+        
+        # 设置环境变量
+        echo "IDF_PATH=~/esp/esp-idf" >> $GITHUB_ENV
+        echo "PATH=~/esp/esp-idf/tools:$PATH" >> $GITHUB_ENV
+    
+    # 5. 构建交叉编译器
+    - name: Build cross compiler
+      run: |
+        # 激活ESP-IDF环境
+        source ~/esp/esp-idf/export.sh
+        
+        # 构建mpy-cross (MicroPython交叉编译器)
+        cd mpy-cross
+        make
+    
+    # 6. 构建ESP32固件
+    - name: Build ESP32 firmware
+      run: |
+        # 激活ESP-IDF环境
+        source ~/esp/esp-idf/export.sh
+        
+        # 进入ESP32端口目录
+        cd ports/esp32
+        
+        # 构建指定的开发板固件
+        make BOARD=${{ matrix.board }} -j$(nproc)
+    
+    # 7. 上传构建产物
+    - name: Upload firmware artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: micropython-esp32-${{ matrix.board }}-firmware
+        path: |
+          ports/esp32/build-${{ matrix.board }}/firmware.bin
+          ports/esp32/build-${{ matrix.board }}/bootloader/bootloader.bin
+          ports/esp32/build-${{ matrix.board }}/partition_table/partition-table.bin
+          ports/esp32/build-${{ matrix.board }}/micropython.elf
+        retention-days: 30
+    
+    # 8. 创建固件信息文件
+    - name: Create firmware info
+      run: |
+        cd ports/esp32
+        echo "Board: ${{ matrix.board }}" > build-${{ matrix.board }}/firmware-info.txt
+        echo "Build Date: $(date)" >> build-${{ matrix.board }}/firmware-info.txt
+        echo "Commit: $(git rev-parse HEAD)" >> build-${{ matrix.board }}/firmware-info.txt
+        echo "ESP-IDF Version: $(cat ~/esp/esp-idf/version.txt)" >> build-${{ matrix.board }}/firmware-info.txt
+    
+    # 9. 上传固件信息
+    - name: Upload firmware info
+      uses: actions/upload-artifact@v4
+      with:
+        name: firmware-info-${{ matrix.board }}
+        path: ports/esp32/build-${{ matrix.board }}/firmware-info.txt
+        retention-days: 30
+
+  # 创建Release (可选)
+  create-release:
+    needs: build-esp32
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    
+    steps:
+    - name: Download all artifacts
+      uses: actions/download-artifact@v4
+    
+    - name: Create Release
+      id: create_release
+      uses: actions/create-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: build-${{ github.run_number }}
+        release_name: MicroPython ESP32 Build ${{ github.run_number }}
+        body: |
+          Automated build of MicroPython ESP32 firmware
+          
+          Commit: ${{ github.sha }}
+          Build Date: ${{ github.event.head_commit.timestamp }}
+          
+          This release contains firmware for:
+          - ESP32_GENERIC
+          - ESP32_GENERIC_S2
+          - ESP32_GENERIC_S3
+          - ESP32_GENERIC_C3
+        draft: false
+        prerelease: false
+    
+    - name: Upload Release Assets
+      run: |
+        # 这里可以添加上传固件文件到Release的逻辑
+        echo "Release created with ID: ${{ steps.create_release.outputs.id }}"
