@@ -1,0 +1,311 @@
+name: Build ESP32 MicroPython (Optimized)
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+    inputs:
+      board:
+        description: 'Board to build (leave empty for all)'
+        required: false
+        default: ''
+        type: choice
+        options:
+          - ''
+          - ESP32_GENERIC
+          - ESP32_GENERIC_S2
+          - ESP32_GENERIC_S3
+          - ESP32_GENERIC_C3
+          - ESP32_GENERIC_C6
+
+env:
+  IDF_PATH: /opt/esp/idf
+  IDF_TOOLS_PATH: /opt/esp
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    
+    strategy:
+      fail-fast: false
+      matrix:
+        board: ${{ github.event.inputs.board && fromJson(format('["{0}"]', github.event.inputs.board)) || fromJson('["ESP32_GENERIC", "ESP32_GENERIC_S2", "ESP32_GENERIC_S3", "ESP32_GENERIC_C3", "ESP32_GENERIC_C6"]') }}
+    
+    steps:
+    - name: Checkout MicroPython
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+        fetch-depth: 0
+    
+    # 使用缓存加速构建
+    - name: Cache ESP-IDF
+      id: cache-idf
+      uses: actions/cache@v4
+      with:
+        path: |
+          /opt/esp/idf
+          /opt/esp/tools
+        key: esp-idf-v5.4.1-${{ runner.os }}
+        restore-keys: |
+          esp-idf-v5.4.1-
+    
+    - name: Cache pip packages
+      uses: actions/cache@v4
+      with:
+        path: ~/.cache/pip
+        key: pip-${{ runner.os }}-${{ hashFiles('**/requirements*.txt') }}
+        restore-keys: |
+          pip-${{ runner.os }}-
+    
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          git wget curl libffi-dev libssl-dev \
+          python3 python3-pip python3-venv \
+          cmake ninja-build ccache \
+          flex bison gperf \
+          libusb-1.0-0-dev
+    
+    - name: Setup ESP-IDF v5.4.1
+      if: steps.cache-idf.outputs.cache-hit != 'true'
+      run: |
+        sudo mkdir -p /opt/esp
+        sudo chown $USER:$USER /opt/esp
+        cd /opt/esp
+        
+        # 克隆ESP-IDF v5.4.1
+        git clone --depth 1 --branch v5.4.1 --recursive https://github.com/espressif/esp-idf.git idf
+        
+        cd idf
+        # 安装工具链
+        ./install.sh esp32,esp32s2,esp32s3,esp32c3,esp32c6,esp32h2
+    
+    - name: Setup ESP-IDF environment
+      run: |
+        cd /opt/esp/idf
+        source export.sh
+        echo "PATH=$PATH" >> $GITHUB_ENV
+        echo "IDF_PATH=/opt/esp/idf" >> $GITHUB_ENV
+        echo "IDF_TOOLS_PATH=/opt/esp" >> $GITHUB_ENV
+        # 添加所有必要的环境变量
+        env | grep -E "(IDF_|ESP|OPENOCD|XTENSA|RISCV)" >> $GITHUB_ENV
+    
+    - name: Build mpy-cross
+      run: |
+        cd mpy-cross
+        make -j$(nproc)
+    
+    - name: Build ESP32 Firmware
+      run: |
+        source /opt/esp/idf/export.sh
+        cd ports/esp32
+        
+        # 清理之前的构建
+        make BOARD=${{ matrix.board }} clean || true
+        
+        # 构建固件
+        echo "Building firmware for ${{ matrix.board }}"
+        make BOARD=${{ matrix.board }} -j$(nproc)
+        
+        # 验证构建文件
+        ls -la build-${{ matrix.board }}/
+        
+        # 创建构建信息
+        echo "=== Build Information ===" > build-${{ matrix.board }}/build-info.txt
+        echo "Board: ${{ matrix.board }}" >> build-${{ matrix.board }}/build-info.txt
+        echo "Date: $(date -u)" >> build-${{ matrix.board }}/build-info.txt
+        echo "Commit: $(git rev-parse HEAD)" >> build-${{ matrix.board }}/build-info.txt
+        echo "ESP-IDF: v5.4.1" >> build-${{ matrix.board }}/build-info.txt
+        echo "Python: $(python3 --version)" >> build-${{ matrix.board }}/build-info.txt
+        echo "Build host: $(hostname)" >> build-${{ matrix.board }}/build-info.txt
+        echo "=========================" >> build-${{ matrix.board }}/build-info.txt
+    
+    - name: Prepare artifacts
+      run: |
+        cd ports/esp32
+        BUILD_DIR="build-${{ matrix.board }}"
+        ARTIFACT_DIR="artifacts-${{ matrix.board }}"
+        
+        mkdir -p "$ARTIFACT_DIR"
+        
+        # 复制主要文件
+        cp "$BUILD_DIR/firmware.bin" "$ARTIFACT_DIR/" 2>/dev/null || echo "firmware.bin not found"
+        cp "$BUILD_DIR/bootloader/bootloader.bin" "$ARTIFACT_DIR/" 2>/dev/null || echo "bootloader.bin not found"
+        cp "$BUILD_DIR/partition_table/partition-table.bin" "$ARTIFACT_DIR/" 2>/dev/null || echo "partition-table.bin not found"
+        cp "$BUILD_DIR/micropython.elf" "$ARTIFACT_DIR/" 2>/dev/null || echo "micropython.elf not found"
+        cp "$BUILD_DIR/build-info.txt" "$ARTIFACT_DIR/"
+        
+        # 创建烧录脚本
+        cat > "$ARTIFACT_DIR/flash.sh" << 'EOF'
+#!/bin/bash
+# ESP32 MicroPython 烧录脚本
+# 使用方法: ./flash.sh [端口] [波特率]
+# 例如: ./flash.sh /dev/ttyUSB0 460800
+
+PORT=${1:-/dev/ttyUSB0}
+BAUD=${2:-460800}
+
+echo "烧录ESP32 MicroPython固件..."
+echo "端口: $PORT"
+echo "波特率: $BAUD"
+echo "开发板: ${{ matrix.board }}"
+
+if ! command -v esptool.py &> /dev/null; then
+    echo "错误: esptool.py 未安装"
+    echo "请运行: pip install esptool"
+    exit 1
+fi
+
+echo "擦除flash..."
+esptool.py --chip esp32 --port "$PORT" erase_flash
+
+echo "烧录固件..."
+if [ -f "firmware.bin" ]; then
+    esptool.py --chip esp32 --port "$PORT" --baud "$BAUD" write_flash -z 0x1000 firmware.bin
+else
+    echo "分段烧录..."
+    esptool.py --chip esp32 --port "$PORT" --baud "$BAUD" write_flash \
+        0x1000 bootloader.bin \
+        0x8000 partition-table.bin \
+        0x10000 micropython.bin
+fi
+
+echo "烧录完成!"
+echo "现在可以使用串口工具连接ESP32 (115200波特率)"
+EOF
+        chmod +x "$ARTIFACT_DIR/flash.sh"
+        
+        # 创建README
+        cat > "$ARTIFACT_DIR/README.md" << EOF
+# MicroPython ESP32 固件
+
+## 开发板信息
+- **开发板**: ${{ matrix.board }}
+- **构建日期**: $(date -u)
+- **ESP-IDF版本**: v5.4.1
+- **提交**: $(git rev-parse HEAD)
+
+## 文件说明
+- \`firmware.bin\` - 完整固件文件
+- \`bootloader.bin\` - 引导程序
+- \`partition-table.bin\` - 分区表
+- \`micropython.elf\` - 调试符号文件
+- \`flash.sh\` - 烧录脚本
+- \`build-info.txt\` - 构建信息
+
+## 烧录方法
+
+### 方法1: 使用烧录脚本
+\`\`\`bash
+chmod +x flash.sh
+./flash.sh /dev/ttyUSB0 460800
+\`\`\`
+
+### 方法2: 手动烧录
+\`\`\`bash
+# 安装esptool
+pip install esptool
+
+# 擦除flash
+esptool.py --chip esp32 --port /dev/ttyUSB0 erase_flash
+
+# 烧录固件
+esptool.py --chip esp32 --port /dev/ttyUSB0 --baud 460800 write_flash -z 0x1000 firmware.bin
+\`\`\`
+
+## 连接MicroPython
+烧录完成后，使用串口工具连接ESP32:
+- 波特率: 115200
+- 数据位: 8
+- 停止位: 1
+- 校验: None
+
+Linux/Mac示例:
+\`\`\`bash
+screen /dev/ttyUSB0 115200
+\`\`\`
+
+Windows示例:
+使用PuTTY或者其他串口工具连接对应的COM端口。
+EOF
+        
+        ls -la "$ARTIFACT_DIR/"
+    
+    - name: Upload firmware
+      uses: actions/upload-artifact@v4
+      with:
+        name: micropython-${{ matrix.board }}-firmware
+        path: ports/esp32/artifacts-${{ matrix.board }}/
+        retention-days: 30
+    
+    - name: Upload build logs
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: build-logs-${{ matrix.board }}
+        path: |
+          ports/esp32/build-${{ matrix.board }}/build.log
+          ports/esp32/build-${{ matrix.board }}/config/
+        retention-days: 7
+
+  create-release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    
+    steps:
+    - name: Download all artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: artifacts
+    
+    - name: Create release archive
+      run: |
+        cd artifacts
+        for dir in micropython-*-firmware; do
+          if [ -d "$dir" ]; then
+            tar -czf "${dir}.tar.gz" "$dir"
+          fi
+        done
+        ls -la *.tar.gz
+    
+    - name: Create Release
+      uses: actions/create-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: build-${{ github.run_number }}
+        release_name: MicroPython ESP32 Build ${{ github.run_number }}
+        body: |
+          🚀 **MicroPython ESP32 自动构建版本**
+          
+          **构建信息:**
+          - ESP-IDF版本: v5.4.1
+          - 构建时间: ${{ github.event.head_commit.timestamp }}
+          - 提交: ${{ github.sha }}
+          
+          **支持的开发板:**
+          - ESP32_GENERIC (ESP32)
+          - ESP32_GENERIC_S2 (ESP32-S2)
+          - ESP32_GENERIC_S3 (ESP32-S3)
+          - ESP32_GENERIC_C3 (ESP32-C3)
+          - ESP32_GENERIC_C6 (ESP32-C6)
+          
+          **使用说明:**
+          1. 下载对应开发板的固件包
+          2. 解压缩文件
+          3. 运行 `flash.sh` 脚本烧录固件
+          4. 或者手动使用 `esptool.py` 烧录 `firmware.bin`
+          
+          **烧录命令:**
+          ```bash
+          pip install esptool
+          esptool.py --chip esp32 --port /dev/ttyUSB0 erase_flash
+          esptool.py --chip esp32 --port /dev/ttyUSB0 --baud 460800 write_flash -z 0x1000 firmware.bin
+          ```
+        draft: false
+        prerelease: false
