@@ -14,8 +14,8 @@ jobs:
     
     strategy:
       matrix:
-        # 定义要构建的ESP32变体
-        board: [ESP32_GENERIC, ESP32_GENERIC_S2, ESP32_GENERIC_S3, ESP32_GENERIC_C3]
+        # 定义要构建的ESP32变体 (包含更多新芯片支持)
+        board: [ESP32_GENERIC, ESP32_GENERIC_S2, ESP32_GENERIC_S3, ESP32_GENERIC_C3, ESP32_GENERIC_C6]
     
     steps:
     # 1. 检出代码
@@ -47,12 +47,12 @@ jobs:
         git clone --recursive https://github.com/espressif/esp-idf.git
         cd esp-idf
         
-        # 检出到与MicroPython兼容的版本 (通常是v5.0.x)
-        git checkout v5.0.4
+        # 检出到与MicroPython兼容的版本 (官方推荐v5.4.1)
+        git checkout v5.4.1
         git submodule update --init --recursive
         
-        # 安装ESP-IDF
-        ./install.sh esp32,esp32s2,esp32s3,esp32c3
+        # 安装ESP-IDF (支持所有ESP32系列芯片)
+        ./install.sh esp32,esp32s2,esp32s3,esp32c3,esp32c6,esp32h2
         
         # 设置环境变量
         echo "IDF_PATH=~/esp/esp-idf" >> $GITHUB_ENV
